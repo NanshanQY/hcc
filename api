@@ -1,0 +1,206 @@
+# visualizer.py (完整版)
+
+import time
+import requests
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+# --- 全局配置 ---
+# 设置中文字体，确保图表能正确显示中文
+plt.rcParams['font.sans-serif'] = ['SimHei'] 
+plt.rcParams['axes.unicode_minus'] = False
+
+# ===================================================================
+# --- 您唯一可能需要手动配置的地方 ---
+#
+# 这是后台执行器脚本API的地址。
+# 如果执行器和本程序在同一台电脑上运行，使用 '127.0.0.1'。
+# 如果执行器在远程服务器上，请替换成服务器的IP地址。
+API_URL = "http://127.0.0.1:5001/api/upgrade_status"
+#
+# ===================================================================
+
+
+class ApiUpgraderAdapter:
+    """
+    这是一个适配器类。它的作用是：
+    1. 从API获取JSON数据。
+    2. 将数据缓存起来。
+    3. 对外提供与您原来的 AppUpgrader 类完全相同的接口（方法和属性）。
+    这使得您的可视化代码无需任何修改即可使用来自API的数据。
+    """
+    def __init__(self, api_url):
+        self.api_url = api_url
+        self._data = {}  # 用于缓存从API获取的最新数据
+        self.services = [] # 动态获取的服务(组件)列表
+
+    def fetch_data(self) -> bool:
+        """从API获取最新数据并更新内部状态，返回是否成功"""
+        try:
+            response = requests.get(self.api_url, timeout=1)
+            response.raise_for_status() # 如果HTTP状态码是4xx或5xx，则抛出异常
+            self._data = response.json()
+            # 动态更新服务列表，确保新任务出现时能被画出来
+            # 我们对服务列表进行排序，确保每次刷新时Y轴顺序稳定
+            self.services = sorted(list(self._data.get("upgrade_status", {}).keys()))
+            return True
+        except requests.RequestException as e:
+            print(f"警告：无法连接到API服务器 at {self.api_url}. 错误: {e}")
+            return False
+
+    # 下面的方法完美模仿了 AppUpgrader 的接口，直接从缓存的_data中取值
+    def get_upgrade_status(self):
+        return self._data.get("upgrade_status", {})
+
+    def get_upgrade_times(self):
+        return self._data.get("upgrade_times", {})
+        
+    @property
+    def start_times(self):
+        return self._data.get("start_times", {})
+
+    @property
+    def upgrade_durations(self):
+        return self._data.get("upgrade_durations", {})
+
+    @property
+    def available_versions(self):
+        return self._data.get("available_versions", {})
+
+    @property
+    def upgrade_candidates(self):
+        return self._data.get("upgrade_candidates", {})
+
+
+class AppUpgradeVisualizer:
+    """
+    您的可视化类，现在它接收一个适配器对象而不是原始的Upgrader。
+    """
+    def __init__(self, upgrader_adapter, total_time):
+        self.upgrader: ApiUpgraderAdapter = upgrader_adapter
+        self.total_time = total_time
+        self.start_time = time.time()  # 记录可视化程序启动的时间
+        self.fig, self.ax = plt.subplots(figsize=(12, 8))
+        self.ani = None
+
+    def init_plot(self):
+        """初始化图表，只在动画开始时调用一次"""
+        self.ax.set_xlim(0, self.total_time)
+        self.ax.set_xlabel("时间 (秒)")
+        self.ax.set_ylabel("组件")
+        self.ax.set_title("升级时间线 (等待API数据...)")
+        return []
+
+    def update_plot(self, frame):
+        """
+        这个函数由FuncAnimation每秒调用一次，负责刷新整个图表。
+        """
+        # 1. 让适配器从API获取最新数据
+        if not self.upgrader.fetch_data():
+            # 如果获取失败，显示错误信息并跳过此次刷新
+            self.ax.clear()
+            self.ax.text(0.5, 0.5, f"错误：无法连接到API服务器\n{API_URL}", 
+                         ha='center', va='center', color='red', fontsize=14)
+            self.ax.set_title("连接中断")
+            return []
+
+        # 2. 准备绘图所需的数据
+        services = self.upgrader.services
+        status = self.upgrader.get_upgrade_status()
+        upgrade_times = self.upgrader.get_upgrade_times()
+
+        # 3. 清空旧画布，准备重绘
+        self.ax.clear()
+        
+        # 4. 如果没有服务，显示等待信息
+        if not services:
+            self.ax.text(0.5, 0.5, "正在等待任务开始...", ha='center', va='center')
+            self.ax.set_title("升级时间线 (已连接到API)")
+            return []
+
+        # 5. 设置图表的基本样式（坐标轴、标题等）
+        current_offset_time = time.time() - self.start_time
+        self.ax.set_xlim(0, self.total_time)
+        self.ax.set_ylim(-0.5, len(services) - 0.5)
+        self.ax.set_xlabel("时间 (秒)")
+        self.ax.set_ylabel("组件")
+        self.ax.set_yticks(range(len(services)))
+        self.ax.set_yticklabels(services, fontsize=9)
+        self.ax.set_title(f"升级时间线 (数据来自API - {time.strftime('%H:%M:%S')})")
+        self.ax.grid(axis='x', linestyle='--', alpha=0.6)
+
+        # 6. 遍历所有服务，绘制时间条
+        for i, component in enumerate(services):
+            app_index = i
+            
+            # 案例 A: 正在升级 (status[component] is True)
+            if status.get(component, False):
+                start_offset = self.upgrader.start_times.get(component, self.start_time) - self.start_time
+                duration = self.upgrader.upgrade_durations.get(component, 0)
+                
+                # 绘制底色条（代表总预计时长）
+                self.ax.barh(app_index, duration, left=start_offset, color='lightgray', height=0.6)
+                
+                # 绘制当前进度条
+                elapsed_time = time.time() - self.upgrader.start_times.get(component, time.time())
+                self.ax.barh(app_index, min(elapsed_time, duration), left=start_offset, color='skyblue', height=0.6)
+                
+                # 显示版本信息
+                original = self.upgrader.available_versions.get(component, ["?"])[0]
+                target = self.upgrader.upgrade_candidates.get(component, "?")
+                version_text = f"{original} -> {target}"
+                self.ax.text(start_offset + duration / 2, app_index, version_text, ha='center', va='center', color='black', fontsize=8)
+
+            # 案例 B: 已经完成 (component in upgrade_times)
+            elif component in upgrade_times:
+                start_offset = self.upgrader.start_times.get(component, self.start_time) - self.start_time
+                duration = upgrade_times[component]
+
+                # 判断升级是否成功 (这里我们假设执行器返回的状态是可靠的)
+                # 注意：原始代码的成功/失败判断逻辑比较复杂，我们简化它
+                # if 'failed' in self.upgrader.get_some_status_flag() ...
+                # 这里我们假设只要在upgrade_times里就是成功，您可根据需要调整
+                color = 'lightgreen'
+                label = f"完成 ({duration:.1f}s)"
+                
+                self.ax.barh(app_index, duration, left=start_offset, color=color, height=0.6)
+                self.ax.text(start_offset + duration + 0.5, app_index, label, va='center', ha='left', fontsize=8)
+
+                # 显示版本信息
+                original = self.upgrader.available_versions.get(component, ["?"])[0]
+                target = self.upgrader.upgrade_candidates.get(component, "?")
+                version_text = f"{original} -> {target}"
+                self.ax.text(start_offset + duration / 2, app_index, version_text, ha='center', va='center', color='black', fontsize=8)
+
+        # 7. 绘制代表“现在”的红色垂直线
+        self.ax.axvline(x=current_offset_time, color='red', linestyle='--', linewidth=1)
+        
+        plt.tight_layout()
+        return []
+
+    def animate(self):
+        """启动动画"""
+        self.ani = FuncAnimation(self.fig, self.update_plot, init_func=self.init_plot,
+                                 interval=1000, blit=False, repeat=True)
+        plt.show()
+
+# ===================================================================
+# --- 主程序入口 ---
+# ===================================================================
+if __name__ == "__main__":
+    # 1. 创建API适配器实例
+    api_adapter = ApiUpgraderAdapter(api_url=API_URL)
+    
+    # 2. 实例化可视化程序
+    # total_time 可以设置一个较长的值，比如一小时 (3600秒)
+    visualizer = AppUpgradeVisualizer(upgrader_adapter=api_adapter, total_time=3600)
+    
+    print("="*50)
+    print("可视化程序已启动。")
+    print(f"正在尝试从API服务器获取数据: {API_URL}")
+    print("请确保后台执行器脚本正在运行。")
+    print("关闭图表窗口即可退出本程序。")
+    print("="*50)
+
+    # 3. 启动动画，开始循环刷新
+    visualizer.animate()
